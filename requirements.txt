@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pandas
+reportlab
+python-multipart
+aiosmtplib
+python-dotenv
+jinja2
+httpx
