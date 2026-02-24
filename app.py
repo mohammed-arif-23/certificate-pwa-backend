@@ -131,7 +131,7 @@ def create_certificate(name: str) -> str:
         font_name = 'Helvetica-Bold'
 
     # Name Configuration
-    c.setFont(font_name, 25)
+    c.setFont(font_name, 118)
     c.setFillColor(HexColor("#000")) # Black
     
     text_width = c.stringWidth(name, font_name, 25)
@@ -139,7 +139,7 @@ def create_certificate(name: str) -> str:
     x = ((width - text_width) / 2) + 50
     
     # Vertical position
-    y = 235 
+    y = 920 
     
     c.drawString(x, y, name)
     c.save()
