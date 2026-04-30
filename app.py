@@ -15,6 +15,7 @@ from email.mime.application import MIMEApplication
 from dotenv import load_dotenv
 import logging
 import httpx
+import asyncio
 
 # Load environment variables
 load_dotenv()
@@ -56,8 +57,13 @@ async def startup_event():
             df.columns = [c.strip() for c in df.columns]
             
             # Smart column finding
-            email_col = next((c for c in df.columns if "email" in c.lower()), None)
-            name_col = next((c for c in df.columns if "name" in c.lower()), None)
+            email_col = next((c for c in df.columns if c.strip().lower() == "email"), None)
+            if not email_col:
+                email_col = next((c for c in df.columns if "email" in c.lower()), None)
+                
+            name_col = next((c for c in df.columns if c.strip().lower() == "name"), None)
+            if not name_col:
+                name_col = next((c for c in df.columns if "name" in c.lower() and "username" not in c.lower()), None)
 
             if email_col and name_col:
                 for _, row in df.iterrows():
@@ -130,16 +136,17 @@ def create_certificate(name: str) -> str:
         logger.warning(f"Font file not found at {font_path}")
         font_name = 'Helvetica-Bold'
 
-    # Name Configuration
-    c.setFont(font_name, 118)
-    c.setFillColor(HexColor("#000")) # Black
+
+    font_size = 34
+    c.setFont(font_name, font_size)
+    c.setFillColor(HexColor("#00685E")) 
     
-    text_width = c.stringWidth(name, font_name, 25)
-    # Center horizontally, adjusted with user's specific offset
-    x = ((width - text_width) / 2) + 50
+    text_width = c.stringWidth(name, font_name, font_size)
+  
+    x = ((width - text_width) / 2) + 310
     
-    # Vertical position
-    y = 920 
+  
+    y = 415
     
     c.drawString(x, y, name)
     c.save()
@@ -152,7 +159,7 @@ async def send_email_async(recipient: str, pdf_path: str):
     msg = MIMEMultipart()
     msg["From"] = os.getenv("SMTP_USER")
     msg["To"] = recipient
-    msg["Subject"] = "Your Certificate - Valli Hospital"
+    msg["Subject"] = "Your Certificate - Iyakkam CME Program"
     body = MIMEText("Thank you for your feedback! Here is your certificate.")
     msg.attach(body)
     with open(pdf_path, "rb") as f:
@@ -180,19 +187,31 @@ async def verify_email(data: EmailRequest):
         has_submitted = False
         if SUPABASE_URL and SUPABASE_KEY:
             try:
+                # Retry logic for DNS issues
                 async with httpx.AsyncClient() as client:
-                    resp = await client.get(
-                        f"{SUPABASE_URL}/rest/v1/feedback",
-                        params={"email": f"eq.{email}", "select": "email"},
-                        headers={
-                            "apikey": SUPABASE_KEY,
-                            "Authorization": f"Bearer {SUPABASE_KEY}",
-                        }
-                    )
-                    if resp.status_code == 200 and len(resp.json()) > 0:
-                        has_submitted = True
+                    for attempt in range(3):
+                        try:
+                            resp = await client.get(
+                                f"{SUPABASE_URL}/rest/v1/feedback",
+                                params={"email": f"eq.{email}", "select": "email"},
+                                headers={
+                                    "apikey": SUPABASE_KEY,
+                                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                                },
+                                timeout=5.0
+                            )
+                            if resp.status_code == 200:
+                                if len(resp.json()) > 0:
+                                    has_submitted = True
+                                break # Success
+                        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                            if attempt == 2: raise
+                            logger.warning(f"Supabase check attempt {attempt+1} failed: {e}. Retrying...")
+                            await asyncio.sleep(1)
             except Exception as e:
-                logger.error(f"Supabase check failed: {e}")
+                logger.error(f"Supabase check failed definitively: {e}")
+                # We still return valid True because the email is in our CSV
+                # but has_submitted will be False as a fallback.
 
         return {"valid": True, "name": EMAIL_TO_NAME[email], "has_submitted": has_submitted}
     raise HTTPException(status_code=404, detail="Email not found")
@@ -220,15 +239,22 @@ async def submit_feedback(data: FeedbackRequest):
     }
     
     async with httpx.AsyncClient() as client:
-        try:
-            response = await client.post(url, json=payload, headers=headers)
-            if response.status_code >= 400:
-                logger.error(f"Supabase error: {response.text}")
-                raise HTTPException(status_code=500, detail=response.text)
-            return {"status": "success"}
-        except Exception as e:
-            logger.error(f"Request error: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+        for attempt in range(3):
+            try:
+                response = await client.post(url, json=payload, headers=headers, timeout=10.0)
+                if response.status_code >= 400:
+                    logger.error(f"Supabase error: {response.text}")
+                    raise HTTPException(status_code=500, detail=response.text)
+                return {"status": "success"}
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                if attempt == 2:
+                    logger.error(f"Request error after 3 attempts: {e}")
+                    raise HTTPException(status_code=500, detail=f"Connection failed: {str(e)}")
+                logger.warning(f"Feedback submission attempt {attempt+1} failed: {e}. Retrying...")
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"Unexpected error: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/generate-certificate")
 async def generate_certificate_endpoint(data: EmailRequest):
@@ -237,7 +263,15 @@ async def generate_certificate_endpoint(data: EmailRequest):
         name = EMAIL_TO_NAME.get(email)
         if not name: raise HTTPException(status_code=404, detail="Name not found")
         pdf = create_certificate(name)
-        return FileResponse(pdf, media_type='application/pdf', filename=os.path.basename(pdf))
+        return FileResponse(
+            pdf, 
+            media_type='application/pdf', 
+            filename=os.path.basename(pdf),
+            headers={
+                "Content-Disposition": f'attachment; filename="{os.path.basename(pdf)}"',
+                "Cache-Control": "no-cache"
+            }
+        )
     except Exception as e:
         logger.error(f"Certificate generation failed: {e}")
         import traceback
